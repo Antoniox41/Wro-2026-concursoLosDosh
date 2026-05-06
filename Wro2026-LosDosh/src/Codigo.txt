@@ -1,0 +1,300 @@
+#include <HUSKYLENS.h>
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <ADebouncer.h>
+#include <elapsedMillis.h>
+#include <Servo.h>
+
+HUSKYLENS huskylens;
+Servo volante;
+
+//Pines sensores US: 1 izq, 2 cen, 3 der, 4 tras
+#define trigPin1 12
+#define echoPin1 13
+#define trigPin2 8
+#define echoPin2 7
+#define trigPin3 6
+#define echoPin3 5
+#define trigPin4 4
+#define echoPin4 3
+
+//pines motor
+#define in1 9
+#define in2 10
+#define inEn 11
+
+//variables de tiempo y medida
+long duracion;
+float distancia;
+float medida;
+int mide11, mide22, mide33, mide44;//Medidas de los respectivos sensores
+elapsedMillis tiempo;
+int tCurva = 500;  //tiempo de giro en curvas (regular empíricamente)
+int T = 25; //tiempo demora centraPista (por no ponerle 0)
+
+//variables control dirección
+float posicionTransversal; //variable realimentada
+int entradaReferencia = 0; //valor 0 para que el coche vaya por el eje de la pista
+int error; //error = -posicionTransversal+entradaReferencia
+float controlPropor; //variable de control, controPropor = kp*error
+float kp=10; //coeficiente de proporcionalidad del control proporcional
+float volantePropor;//variable manipulada (se introduce en el servo)
+
+//VELOCIDADES
+int vel = 200; //velocidad normal
+int velRap = 255;  //velocidad máxima
+int velLen = 150;  //velocidad lenta
+
+//Control obstáculos
+bool modoAbierto = 1; //Modo obstánculos modoAbierto = 0
+bool esquivando = false;
+elapsedMillis tiempoEsquiva;
+int duracionEsquiva = 700; // milisegundos
+
+//flags de control de funciones
+int nCurva = 0; //cuatro curvas es una vuelta
+bool flag1=0, flag2=0, flag3=0, flag4=0; //validación medida sensores
+bool flag5=0; //validación final recorrido.
+
+// =========================================================
+//                      KALMAN 1D
+// =========================================================
+struct Kalman1D {
+    float x;      //Estimación de la medida
+    float P;      //varianza de la estimación
+    float Q;      //varianza del ruido del modelo (incertidumbre al predecir)
+    float R;      //varianza del ruido de la medición
+};
+
+float Pini = 200;  //varianza de la estimación previa inicial (se actualiza)
+float Qini = 3;    //varianza del ruido del modelo (no se actualiza)
+float Rlat = 50;   //varianza del ruido medición sensores laterales
+float Rdel = 80;   //varianza del ruido medicion sensores delantero y trasero.
+
+Kalman1D kL = {0, Pini, Qini, Rlat};
+Kalman1D kF = {0, Pini, Qini, Rdel};
+Kalman1D kR = {0, Pini, Qini, Rlat};
+Kalman1D kB = {0, Pini, Qini, Rdel};
+
+float kalmanUpdate(Kalman1D &k, float m) {
+    k.P = k.P + k.Q;  //Estimación de la incertidumbre de la medida (incertidumbre previa + ruido modelo)
+    float K = k.P / (k.P + k.R); //K es la gancia de Kalman 
+    k.x = k.x + K * (m - k.x);   //estimación de magnitud medida 
+    k.P = (1 - K) * k.P;   //actualización de la estimación de la incertidumbre
+    return k.x;
+}
+
+
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  pinMode(trigPin1, OUTPUT);
+  pinMode(echoPin1, INPUT);
+  pinMode(trigPin2, OUTPUT);
+  pinMode(echoPin2, INPUT);
+  pinMode(trigPin3, OUTPUT);
+  pinMode(echoPin3, INPUT);
+  pinMode(trigPin4, OUTPUT);
+  pinMode(echoPin4, INPUT);
+  pinMode(in1,OUTPUT);
+  pinMode(in2,OUTPUT);
+  pinMode(inEn,OUTPUT);
+  
+  volante.attach(A0);
+  digitalWrite(in1,0);
+  digitalWrite(in2,1);
+  analogWrite(inEn,vel);
+
+  if (!huskylens.begin(Wire)) {
+    //Serial.println("Fallo conexion HuskyLens");//Cambiar esto por encender pin13
+    pinMode(13, OUTPUT);
+    while (1) {
+      digitalWrite(13, HIGH);
+      delay(350);
+      digitalWrite(13, LOW);
+      delay(350);
+    }
+  }
+}
+
+void loop() {
+
+centraEnPista(0);
+giraIzq();
+//paraDesafioAbierto();
+//centraEnPistaTest(0);
+  
+}
+
+float mide1(){    
+  digitalWrite(trigPin1, LOW);
+  delayMicroseconds(2);
+  // Enviar pulso ultrasónico
+  digitalWrite(trigPin1, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin1, LOW);
+  // Leer el eco
+  duracion = pulseIn(echoPin1, HIGH);
+  // Calcular distancia en cm
+  distancia = duracion * 0.034 / 2;
+  return distancia;
+}
+
+float mide2(){    
+  digitalWrite(trigPin2, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin2, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin2, LOW);
+  duracion = pulseIn(echoPin2, HIGH);
+  distancia = duracion * 0.034 / 2;
+  return distancia;
+}
+
+float mide3(){    
+  digitalWrite(trigPin3, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin3, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin3, LOW);
+  duracion = pulseIn(echoPin3, HIGH);
+  distancia = duracion * 0.034 / 2;
+  return distancia;
+}
+
+float mide4(){    
+  digitalWrite(trigPin4, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin4, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin4, LOW);
+  duracion = pulseIn(echoPin4, HIGH);
+  distancia = duracion * 0.034 / 2;
+  return distancia;
+}
+
+void centraEnPista(int entRef){ 
+mide33 = mide3();
+if (mide33< 200 && mide33>0) {
+  flag3 = 1; 
+  mide33 = kalmanUpdate(kL, mide33);
+  }//rechaza medidas largas
+ mide11 = mide1();
+if (mide11< 200 && mide11>0) {
+  flag1 = 1;
+  kalmanUpdate(kL, mide11);
+  }//rechaza medidas largas
+if (flag1 && flag3) { //si las medidas son válidas calcula la corrección del volante
+  posicionTransversal = mide33-mide11;
+  error = posicionTransversal - entRef;
+  controlPropor = kp*error;
+  volantePropor = map(controlPropor,-200,200,20,160);
+  if (volantePropor < 20){volantePropor=20;}
+  if (volantePropor > 160){volantePropor=160;}
+  volante.write(volantePropor);
+  flag1=0; flag3=0;
+  delay(T);
+  }
+}
+
+void giraIzq(){
+   mide22 = mide2(); mide11 = mide1();
+   if ((mide22 < 50 && mide22 > 0) && (mide11<300 && mide11 > 50)) {//cambiar los valores en el concurso real
+    volante.write(45);  // llamas a tu función
+    delay(tCurva);  // pequeño tiempo para que gire
+    nCurva++;
+    if (nCurva == 12) {flag5=1; tiempo=0;}
+  }
+}
+
+void paraDesafioAbierto(){
+  if (flag5 && tiempo>1000) {analogWrite(inEn,0); while(1){}}
+}
+
+void esquivaObstaculo(){
+  int areaRojo = 0;
+  int areaVerde = 0;
+  //Leer objetos
+  while (huskylens.available()) {   //LeerObjeto
+    HUSKYLENSResult result = huskylens.read();
+    int area = result.width * result.height;
+
+    if (result.ID == 1 && area > areaRojo) {
+      areaRojo = area;
+    }
+
+    if (result.ID == 2 && area > areaVerde) {
+      areaVerde = area;
+    }
+  }
+  //Decidir cuál esquivar
+ if (areaRojo > areaVerde && areaRojo > 500) {//"ROJO cercano → esquivar izquierda");
+    volante.write(45); // izquierda
+    analogWrite(inEn, velLen);
+    delay(duracionEsquiva);
+    volante.write(135); // vuelve al centro
+    delay(duracionEsquiva);
+    analogWrite(inEn, vel);
+
+  } 
+  else if (areaVerde > areaRojo && areaVerde > 500) {//VERDE cercano → esquivar derecha");
+   volante.write(135); // izquierda
+    analogWrite(inEn, velLen);
+    delay(duracionEsquiva);
+    volante.write(45); // vuelve al centro
+    delay(duracionEsquiva);
+    analogWrite(inEn, vel);
+  } 
+  
+}
+
+void centraEnPistaTest(int entRef){
+  mide33 = mide3();
+if (mide33< 200 && mide33>0) {flag3 = 1; mide33 = kalmanUpdate(kL, mide33);}//rechaza medidas largas
+ mide11 = mide1();
+if (mide11< 200 && mide11>0) {flag1 = 1; mide11 = kalmanUpdate(kR, mide11);}//rechaza medidas largas
+if (flag1 && flag3) { //si las medidas son válidas calcula la corrección del volante
+  posicionTransversal = mide33-mide11;
+  error = posicionTransversal - entRef;
+  controlPropor = kp*error;
+  volantePropor = map(controlPropor,-200,200,20,160);
+  if (volantePropor < 20){volantePropor=20;}
+  if (volantePropor > 160){volantePropor=160;}
+    volante.write(volantePropor);
+  flag1=0; flag3=0;
+  Serial.print("izq-1: ");
+  Serial.print(mide11);
+   Serial.print(", der-3: ");
+  Serial.print(mide33);
+  Serial.print(", posicionTransversal: ");
+  Serial.println(posicionTransversal);
+    Serial.print(", kp: ");
+  Serial.print(kp);
+  Serial.print(", volante: ");
+  Serial.print(volantePropor);
+  Serial.print(", tiempo medición: ");
+//  Serial.println(tiempo);
+  Serial.flush();
+  delay(100);
+//  tiempo = 0;
+  }
+}
+
+void testUS(){
+  mide11 = mide1();
+  mide22 = mide2();
+  mide33 = mide3();
+  mide44 = mide4();
+  Serial.print("izq-1: ");
+  Serial.print(mide11);
+  Serial.print(", cen-2: ");
+  Serial.print(mide22);
+  Serial.print(", der-3: ");
+  Serial.print(mide33);
+  Serial.print(", tras-4: ");
+  Serial.println(mide44);
+  Serial.flush();
+  delay(1000);
+}
